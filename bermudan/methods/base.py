@@ -16,12 +16,11 @@ class PricingResult:
     price : float
         Estimated option price V(0, S0).
     std : float
-        Standard deviation of the Monte Carlo estimate (0 if not applicable).
+        Standard deviation of the Monte Carlo estimate.
     elapsed : float
         Wall-clock time in seconds.
     info : dict
-        Method-specific extras (e.g. trained networks, loss history,
-        exercise boundaries, continuation values).
+        Method-specific extras (trained networks, loss history, etc.).
     """
 
     price: float = 0.0
@@ -31,7 +30,10 @@ class PricingResult:
 
 
 class PricingMethod(ABC):
-    """Base class for all pricing methods (LSMC, DOS, PG)."""
+    """Base class for all pricing methods (LSMC, DOS, PG).
+
+    The computation device and dtype are read from ``option.cfg``.
+    """
 
     @abstractmethod
     def price(
@@ -39,7 +41,6 @@ class PricingMethod(ABC):
         option: BermudanOption,
         S0: torch.Tensor,
         n_paths: int,
-        device: torch.device | None = None,
         **kwargs,
     ) -> PricingResult:
         """Compute the Bermudan option price.
@@ -47,13 +48,11 @@ class PricingMethod(ABC):
         Parameters
         ----------
         option : BermudanOption
-            Full problem specification.
+            Full problem specification (includes cfg with device/dtype).
         S0 : Tensor
             Initial state vector.
         n_paths : int
             Number of Monte Carlo paths.
-        device : torch.device or None
-            Computation device.  None → auto-detect.
 
         Returns
         -------

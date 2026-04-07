@@ -17,6 +17,11 @@ class FeedForward(nn.Module):
         Activation for hidden layers: "relu" or "tanh".
     output_activation : str or None, default None
         Activation on the final layer.  "sigmoid" for probability output.
+    batch_norm_input : bool, default False
+        If True, apply BatchNorm1d on the raw input before the first
+        linear layer.  Normalises heterogeneous feature scales (prices
+        ~100, times ~0.3) and is critical for DOS convergence.
+        Safely skips normalisation for single-sample batches.
     """
 
     def __init__(
@@ -26,8 +31,11 @@ class FeedForward(nn.Module):
         output_dim: int = 1,
         activation: str = "relu",
         output_activation: str | None = None,
+        batch_norm_input: bool = False,
     ):
         super().__init__()
+
+        self._bn_input = nn.BatchNorm1d(input_dim) if batch_norm_input else None
 
         act_fn = {"relu": nn.ReLU, "tanh": nn.Tanh}[activation]
 
@@ -48,6 +56,8 @@ class FeedForward(nn.Module):
         self._n_params = sum(p.numel() for p in self.parameters())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._bn_input is not None and x.shape[0] > 1:
+            x = self._bn_input(x)
         return self.net(x)
 
     @property

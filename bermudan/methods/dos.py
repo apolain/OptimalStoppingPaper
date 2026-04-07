@@ -2,187 +2,257 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from ..networks.features import build_features
-from ..networks.feedforward import FeedForward
 from ..options.bermudan import BermudanOption
 from ..utils.timing import timer
 from .base import PricingMethod, PricingResult
 
 
-class DOS(PricingMethod):
-    """Deep Optimal Stopping.
+class DOSNetwork(nn.Module):
+    """Network architecture matching Becker et al. exactly.
 
-    At each exercise date n (backward from N_S-2 to 0), a network f_n
-    is trained to output a stopping indicator:
-
-        f_n(phi(S, t_n, T)) ∈ (0, 1)
-
-    Training minimises the negative expected discounted payoff, where
-    the decision rule at dates > n is already fixed from earlier
-    backward steps.
+    BN(input) → [Linear(no bias) → BN → ReLU] × L → Linear → scalar logit
 
     Parameters
     ----------
+    input_dim : int
+        Raw state dimension (d for max-call, 1 for put).
     hidden_dims : list[int]
-        Hidden layer widths for each per-date network.
-    activation : str
-        Activation in hidden layers ("relu" or "tanh").
+        Widths of hidden layers (paper uses [d+50, d+50]).
+    """
+
+    def __init__(self, input_dim: int, hidden_dims: list[int]):
+        super().__init__()
+        self.input_bn = nn.BatchNorm1d(input_dim)
+
+        layers = []
+        in_dim = input_dim
+        for h in hidden_dims:
+            layers.append(nn.Linear(in_dim, h, bias=False))
+            layers.append(nn.BatchNorm1d(h))
+            layers.append(nn.ReLU())
+            in_dim = h
+        # Final layer: scalar logit, no activation
+        layers.append(nn.Linear(in_dim, 1))
+
+        self.layers = nn.Sequential(*layers)
+
+        # Xavier uniform init (matching TF default)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        self._n_params = sum(p.numel() for p in self.parameters())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        x : (batch, input_dim), float32
+
+        Returns
+        -------
+        logit : (batch, 1)
+        """
+        if x.shape[0] > 1:
+            x = self.input_bn(x)
+        return self.layers(x)
+
+    @property
+    def n_params(self) -> int:
+        return self._n_params
+
+
+class DOS(PricingMethod):
+    """Deep Optimal Stopping.
+
+    Parameters
+    ----------
+    hidden_dims : list[int] or None
+        Hidden layer widths.  None → [d+50, d+50] (paper default).
     lr : float
-        Learning rate for Adam.
-    n_epochs : int
-        Training epochs per exercise date.
+        Adam learning rate.
+    n_iters : int
+        Number of gradient steps per exercise date.
     batch_size : int
-        Mini-batch size for training.  If 0, use full batch.
+        Paths per training batch (fresh simulation each iteration).
+    n_eval : int
+        Paths for final price evaluation (separate from training).
     """
 
     def __init__(
         self,
         hidden_dims: list[int] | None = None,
-        activation: str = "relu",
-        lr: float = 1e-3,
-        n_epochs: int = 200,
-        batch_size: int = 0,
+        lr: float = 0.001,
+        n_iters: int = 1000,
+        batch_size: int = 8192,
     ):
-        self.hidden_dims = hidden_dims or [64, 64]
-        self.activation = activation
+        self._hidden_dims_override = hidden_dims
         self.lr = lr
-        self.n_epochs = n_epochs
+        self.n_iters = n_iters
         self.batch_size = batch_size
+
+    def _get_hidden_dims(self, d: int) -> list[int]:
+        if self._hidden_dims_override is not None:
+            return self._hidden_dims_override
+        return [d + 50, d + 50]
 
     def price(
         self,
         option: BermudanOption,
         S0: torch.Tensor,
         n_paths: int,
-        device: torch.device | None = None,
         **kwargs,
     ) -> PricingResult:
-        dev = device or torch.device("cpu")
+        """Train and evaluate. Pass ``logger=ExperimentLogger(...)`` to log."""
+        logger = kwargs.get("logger", None)
+        cfg = option.cfg
 
-        with timer() as t:
-            # --- Simulate paths ---
-            paths = option.simulate(S0, n_paths, device=dev)
-            obs = option.observable_at_exercise(paths)  # (M, N_S, state_dim)
+        N_S = option.N_S
+        r = option.r
+        ex_dates = option.exercise_dates
+        T = option.T
+        payoff = option.payoff
+        d = option.diffusion.state_dim
 
-            M = n_paths
-            N_S = option.N_S
-            r = option.r
-            ex_dates = option.exercise_dates.to(dev)
-            T = option.T
-            payoff = option.payoff
-            n_feat = payoff.n_features
+        hidden_dims = self._get_hidden_dims(d)
+        discount = torch.exp(-r * ex_dates).to(cfg.device)
 
-            # Payoffs at each exercise date
-            payoff_matrix = torch.zeros(M, N_S, device=dev)
-            for n in range(N_S):
-                payoff_matrix[:, n] = payoff(obs[:, n, :])
+        networks: list[DOSNetwork | None] = [None] * N_S
+        loss_history: dict[int, list[float]] = {}
 
-            # Discount factors from each exercise date to t=0
-            discount = torch.exp(-r * ex_dates).to(dev)  # (N_S,)
-
-            # Networks: one per exercise date (except last, where we always exercise)
-            networks: list[FeedForward | None] = [None] * N_S
-
-            # stopped[m] = True if path m has been stopped at or before current date
-            stopped = torch.zeros(M, dtype=torch.bool, device=dev)
-
-            # cashflow[m] = discounted payoff obtained by path m
-            cashflow = torch.zeros(M, device=dev)
-
-            # At maturity: always exercise remaining paths
-            alive_last = ~stopped
-            cashflow[alive_last] = discount[-1] * payoff_matrix[alive_last, -1]
-            stopped[alive_last] = True
-
-            # --- Backward training ---
-            loss_history: dict[int, list[float]] = {}
-
+        with timer() as train_timer:
+            # --- Backward training: one network per date ---
             for n in range(N_S - 2, -1, -1):
-                # Future value for alive paths: what they'll get if they continue
-                # This is already determined by decisions at dates > n
-                future_val = cashflow.clone()  # discounted to t=0
-
-                # Build features at date n
-                S_n = obs[:, n, :]
-                t_n = ex_dates[n]
-                phi = build_features(payoff, S_n, t_n, T)  # (M, n_feat)
-
-                # Immediate exercise value (discounted to 0)
-                imm_val = discount[n] * payoff_matrix[:, n]  # (M,)
-
-                # Train network to decide stop (1) vs continue (0)
-                net = FeedForward(
-                    input_dim=n_feat,
-                    hidden_dims=self.hidden_dims,
-                    output_dim=1,
-                    activation=self.activation,
-                    output_activation="sigmoid",
-                ).to(dev)
+                net = DOSNetwork(
+                    input_dim=d,
+                    hidden_dims=hidden_dims,
+                ).to(cfg.device)
 
                 optimizer = optim.Adam(net.parameters(), lr=self.lr)
-                bs = self.batch_size if self.batch_size > 0 else M
                 losses = []
 
-                for epoch in range(self.n_epochs):
-                    perm = torch.randperm(M, device=dev)
-                    epoch_loss = 0.0
-                    n_batches = 0
+                for it in range(self.n_iters):
+                    # Fresh batch at each iteration (key to DOS)
+                    paths = option.simulate(S0, self.batch_size)
+                    obs = option.observable_at_exercise(paths)
 
-                    for start in range(0, M, bs):
-                        idx = perm[start : start + bs]
-                        phi_b = phi[idx]
-                        imm_b = imm_val[idx]
-                        fut_b = future_val[idx]
+                    # Raw state at date n (float32 for network)
+                    X_n = obs[:, n, :].float()
 
-                        prob_stop = net(phi_b).squeeze(-1)  # (B,)
+                    # Immediate exercise value (discounted to 0)
+                    imm = (discount[n] * payoff(obs[:, n, :])).float()
 
-                        # Expected value = p * immediate + (1-p) * future
-                        value = prob_stop * imm_b + (1.0 - prob_stop) * fut_b
+                    # Continuation value from future strategy (hard decisions)
+                    with torch.no_grad():
+                        # Start with terminal payoff
+                        cont = (discount[-1] * payoff(obs[:, -1, :])).float()
+                        # Apply each future network backward
+                        for k in range(N_S - 2, n, -1):
+                            if networks[k] is not None:
+                                networks[k].eval()
+                                X_k = obs[:, k, :].float()
+                                logit_k = networks[k](X_k).squeeze(-1)
+                                stop_k = logit_k >= 0
+                                imm_k = (discount[k] * payoff(obs[:, k, :])).float()
+                                cont = torch.where(stop_k, imm_k, cont)
 
-                        loss = -value.mean()
-                        optimizer.zero_grad()
-                        loss.backward()
-                        optimizer.step()
+                    # Train: maximise E[F(X_n)*imm + (1-F(X_n))*cont]
+                    net.train()
+                    logit = net(X_n).squeeze(-1)
+                    F = torch.sigmoid(logit)
 
-                        epoch_loss += loss.item()
-                        n_batches += 1
+                    value = F * imm + (1.0 - F) * cont
+                    loss = -value.mean()
 
-                    losses.append(epoch_loss / n_batches)
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+
+                    losses.append(loss.item())
+
+                    if logger is not None:
+                        logger.log_epoch(date=n, iteration=it, loss=loss.item())
 
                 loss_history[n] = losses
                 networks[n] = net
 
-                # --- Apply trained decision (hard threshold at 0.5) ---
-                with torch.no_grad():
-                    prob = net(phi).squeeze(-1)
-                    do_stop = (prob >= 0.5) & (payoff_matrix[:, n] > 0)
-
-                # Update cashflows: paths that stop here get immediate value
-                newly_stopped = do_stop & (
-                    ~stopped if n > 0 else torch.ones(M, dtype=torch.bool, device=dev)
-                )
-                # For n=0, all paths must get a value
-                if n == 0:
-                    # Paths not yet stopped continue to their future value
-                    # Paths that stop here get immediate value
-                    cashflow[do_stop] = imm_val[do_stop]
-                else:
-                    cashflow[newly_stopped] = imm_val[newly_stopped]
-                    stopped[newly_stopped] = True
-
-            # --- Final price ---
-            price_val = cashflow.mean().item()
-            std_val = cashflow.std().item() / (M**0.5)
+        # --- Evaluation on fresh paths ---
+        with timer() as eval_timer:
+            price_val, std_val = self._evaluate(networks, option, S0, n_paths)
 
         total_params = sum(net.n_params for net in networks if net is not None)
+
+        if logger is not None:
+            models = {
+                f"net_date{n}": net.state_dict()
+                for n, net in enumerate(networks)
+                if net is not None
+            }
+            logger.save_models_dict(models)
 
         return PricingResult(
             price=price_val,
             std=std_val,
-            elapsed=t.elapsed,
+            elapsed=train_timer.elapsed,
             info={
                 "networks": networks,
                 "loss_history": loss_history,
                 "total_params": total_params,
+                "train_time": train_timer.elapsed,
+                "eval_time": eval_timer.elapsed,
             },
         )
+
+    @staticmethod
+    @torch.no_grad()
+    def _evaluate(
+        networks: list[DOSNetwork | None],
+        option: BermudanOption,
+        S0: torch.Tensor,
+        n_paths: int,
+    ) -> tuple[float, float]:
+        """Evaluate the learned strategy on fresh paths (forward pass)."""
+        cfg = option.cfg
+        paths = option.simulate(S0, n_paths)
+        obs = option.observable_at_exercise(paths)
+        ex_dates = option.exercise_dates
+        payoff = option.payoff
+        r = option.r
+        N_S = option.N_S
+        M = n_paths
+        discount = torch.exp(-r * ex_dates).to(cfg.device)
+
+        # Set all networks to eval mode (use BN running stats)
+        for net in networks:
+            if net is not None:
+                net.eval()
+
+        stopped = torch.zeros(M, dtype=torch.bool, device=cfg.device)
+        cashflow = cfg.zeros(M)
+
+        for n in range(N_S):
+            alive = ~stopped
+            if alive.sum() == 0:
+                break
+
+            if n == N_S - 1:
+                cashflow[alive] = discount[n] * payoff(obs[alive, n, :])
+                stopped[alive] = True
+            elif networks[n] is not None:
+                X_n = obs[alive, n, :].float()
+                logit = networks[n](X_n).squeeze(-1)
+                do_stop = logit >= 0
+
+                alive_idx = torch.where(alive)[0]
+                stop_idx = alive_idx[do_stop]
+
+                cashflow[stop_idx] = discount[n] * payoff(obs[stop_idx, n, :])
+                stopped[stop_idx] = True
+
+        never = ~stopped
+        if never.sum() > 0:
+            cashflow[never] = discount[-1] * payoff(obs[never, -1, :])
+
+        return cashflow.mean().item(), cashflow.std().item() / (M**0.5)

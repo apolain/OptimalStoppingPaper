@@ -1,6 +1,5 @@
 from itertools import combinations_with_replacement
 
-import numpy as np
 import torch
 
 from ..options.bermudan import BermudanOption
@@ -15,10 +14,8 @@ class LSMC(PricingMethod):
     ----------
     degree : int, default 2
         Maximum total degree of the polynomial basis.
-        In dimension d, the number of basis functions is C(d + degree, degree).
     use_payoff_in_basis : bool, default True
-        If True, append g(S) as an extra regressor (improves fit for
-        max-call where the payoff structure is non-trivial).
+        If True, append g(S) as an extra regressor.
     """
 
     def __init__(self, degree: int = 2, use_payoff_in_basis: bool = True):
@@ -30,57 +27,44 @@ class LSMC(PricingMethod):
         option: BermudanOption,
         S0: torch.Tensor,
         n_paths: int,
-        device: torch.device | None = None,
         **kwargs,
     ) -> PricingResult:
-        dev = device or torch.device("cpu")
+        cfg = option.cfg
 
         with timer() as t:
-            # --- Simulate paths ---
-            paths = option.simulate(S0, n_paths, device=dev)  # (M, N+1, full_dim)
+            paths = option.simulate(S0, n_paths)  # (M, N+1, full_dim)
             obs = option.observable_at_exercise(paths)  # (M, N_S, state_dim)
 
             M = n_paths
             N_S = option.N_S
             r = option.r
-            ex_dates = option.exercise_dates.to(dev)  # (N_S,)
-            d = option.diffusion.state_dim
+            ex_dates = option.exercise_dates  # (N_S,)
 
-            # --- Compute payoffs at every exercise date ---
-            # payoff_matrix[m, n] = g(S_{u_n}^m)
-            payoff_matrix = torch.zeros(M, N_S, device=dev)
+            # Payoffs at every exercise date
+            payoff_matrix = cfg.zeros(M, N_S)
             for n in range(N_S):
                 payoff_matrix[:, n] = option.payoff(obs[:, n, :])
 
-            # --- Backward induction ---
-            # cashflow[m] = discounted cashflow from the current optimal strategy
-            # stop_idx[m] = exercise-date index at which path m stops
-            stop_idx = torch.full((M,), N_S - 1, device=dev, dtype=torch.long)
-            cashflow = payoff_matrix[:, -1].clone()  # at maturity, always exercise
+            # Backward induction
+            stop_idx = torch.full((M,), N_S - 1, device=cfg.device, dtype=torch.long)
+            cashflow = payoff_matrix[:, -1].clone()
 
-            for n in range(N_S - 2, 0, -1):  # skip n=0 (will handle pricing at t=0)
-                dt_to_next = ex_dates[stop_idx] - ex_dates[n]
-                continuation = cashflow * torch.exp(-r * dt_to_next)
+            for n in range(N_S - 2, 0, -1):
+                dt_to_stop = ex_dates[stop_idx] - ex_dates[n]
+                continuation = cashflow * torch.exp(-r * dt_to_stop)
 
-                # Only regress on paths that are in-the-money
                 itm = payoff_matrix[:, n] > 0
-                if itm.sum() == 0:
+                if itm.sum() < 2:
                     continue
 
-                S_itm = obs[itm, n, :]  # (M_itm, d)
-                Y_itm = continuation[itm]  # (M_itm,)
+                S_itm = obs[itm, n, :]
+                Y_itm = continuation[itm]
 
-                # Build polynomial basis
-                X = self._build_basis(S_itm, option.payoff, obs[itm, n, :], n, option)
+                X = self._build_basis(S_itm, option.payoff, obs[itm, n, :])
 
-                # Least-squares regression: Y = X @ beta
-                # Use lstsq for numerical stability
-                result = torch.linalg.lstsq(X, Y_itm.unsqueeze(-1))
-                beta = result.solution.squeeze(-1)  # (n_basis,)
+                beta = torch.linalg.lstsq(X, Y_itm.unsqueeze(-1)).solution.squeeze(-1)
+                C_hat = X @ beta
 
-                C_hat = X @ beta  # (M_itm,)
-
-                # Exercise if immediate payoff > estimated continuation
                 exercise = payoff_matrix[itm, n] >= C_hat
                 idx_itm = torch.where(itm)[0]
                 idx_exercise = idx_itm[exercise]
@@ -88,8 +72,7 @@ class LSMC(PricingMethod):
                 cashflow[idx_exercise] = payoff_matrix[idx_exercise, n]
                 stop_idx[idx_exercise] = n
 
-            # --- Price at t=0 ---
-            # Discount each path's cashflow back to t=0
+            # Price at t=0
             discount_factors = torch.exp(-r * ex_dates[stop_idx])
             discounted = cashflow * discount_factors
 
@@ -100,7 +83,11 @@ class LSMC(PricingMethod):
             price=price,
             std=std,
             elapsed=t.elapsed,
-            info={"stop_idx": stop_idx.cpu()},
+            info={
+                "stop_idx": stop_idx.cpu(),
+                "train_time": t.elapsed,
+                "eval_time": 0.0,
+            },
         )
 
     def _build_basis(
@@ -108,43 +95,27 @@ class LSMC(PricingMethod):
         S: torch.Tensor,
         payoff,
         S_raw: torch.Tensor,
-        n: int,
-        option: BermudanOption,
     ) -> torch.Tensor:
         """Build polynomial basis matrix.
 
-        Parameters
-        ----------
-        S : Tensor, shape (M_itm, d)
-        payoff : Payoff
-        S_raw : Tensor, shape (M_itm, d)
-        n : int – exercise date index
-        option : BermudanOption
-
-        Returns
-        -------
-        X : Tensor, shape (M_itm, n_basis)
+        Uses raw (un-normalised) asset prices; numerical stability is
+        ensured by the dtype (float64 recommended).
         """
         M, d = S.shape
         dev = S.device
+        dt = S.dtype
 
-        # Normalise inputs for numerical stability
-        S_norm = S / (payoff.K + 1e-8)
-
-        # Generate all monomials up to `degree`
-        columns = [torch.ones(M, device=dev)]  # constant term
+        columns = [torch.ones(M, device=dev, dtype=dt)]
         indices = list(range(d))
 
         for deg in range(1, self.degree + 1):
             for combo in combinations_with_replacement(indices, deg):
-                col = torch.ones(M, device=dev)
+                col = torch.ones(M, device=dev, dtype=dt)
                 for idx in combo:
-                    col = col * S_norm[:, idx]
+                    col = col * S[:, idx]
                 columns.append(col)
 
         if self.use_payoff_in_basis:
             columns.append(payoff(S_raw))
 
-        return torch.stack(
-            columns, dim=-1
-        )  # (M_itm, n_basis)        return torch.stack(columns, dim=-1)  # (M_itm, n_basis)
+        return torch.stack(columns, dim=-1)

@@ -1,5 +1,6 @@
 import torch
 
+from ..utils.seeds import TorchConfig
 from .base import Diffusion
 
 
@@ -28,31 +29,23 @@ class GBM(Diffusion):
         rho: torch.Tensor | None = None,
         d: int = 1,
     ):
-        # --- dimension ---
         if isinstance(sigma, (list, tuple)):
             d = len(sigma)
         self.d = d
-
         self.r = r
-
-        # --- per-asset vectors (stored as plain Python; moved to device in simulate) ---
         self._sigma = [sigma] * d if isinstance(sigma, (int, float)) else list(sigma)
         self._q = [q] * d if isinstance(q, (int, float)) else list(q)
-
         assert len(self._sigma) == d
         assert len(self._q) == d
 
-        # --- correlation → Cholesky ---
         if rho is not None:
-            assert rho.shape == (d, d), f"rho must be ({d},{d}), got {rho.shape}"
-            self._rho = rho.float()
+            assert rho.shape == (d, d)
+            self._rho = rho
         else:
             self._rho = torch.eye(d)
 
-        # Cholesky factor L such that L L^T = rho
-        self._L = torch.linalg.cholesky(self._rho)
-
-    # ----- Diffusion interface -----
+        # Cholesky stored in float64 (will be cast to cfg.dtype in simulate)
+        self._L = torch.linalg.cholesky(self._rho.double())
 
     @property
     def state_dim(self) -> int:
@@ -67,44 +60,48 @@ class GBM(Diffusion):
         S0: torch.Tensor,
         time_grid: torch.Tensor,
         n_paths: int,
-        device: torch.device | None = None,
+        cfg: TorchConfig | None = None,
     ) -> torch.Tensor:
         """Exact log-normal simulation.
 
+        Paths are generated in ``cfg.sim_dtype`` (default float32)
+        for speed.  The exact log-normal scheme has no discretisation
+        error, so float32 precision is sufficient for simulation.
+
         Returns
         -------
-        paths : Tensor, shape (n_paths, n_steps+1, d)
+        paths : Tensor, shape (n_paths, n_steps+1, d), dtype=sim_dtype
         """
-        dev = device or S0.device
+        cfg = self._resolve_cfg(S0, cfg)
+        sd = cfg.sim_dtype
         d = self.d
         n_steps = len(time_grid) - 1
 
-        sigma = torch.tensor(self._sigma, device=dev, dtype=torch.float32)  # (d,)
-        q = torch.tensor(self._q, device=dev, dtype=torch.float32)  # (d,)
-        L = self._L.to(dev)  # (d, d)
-        S0 = S0.to(dev).float()
+        sigma = torch.tensor(self._sigma, device=cfg.device, dtype=sd)
+        q = torch.tensor(self._q, device=cfg.device, dtype=sd)
+        L = self._L.to(device=cfg.device, dtype=sd)
+        S0 = S0.to(device=cfg.device, dtype=sd)
+        time_grid = time_grid.to(
+            device=cfg.device, dtype=torch.float64
+        )  # keep dt precise
 
         if S0.dim() == 0:
             S0 = S0.unsqueeze(0)
         assert S0.shape == (d,), f"S0 must have shape ({d},), got {S0.shape}"
 
-        # Pre-compute drift per unit time: (r - q_i - 0.5 sigma_i^2)
-        drift_rate = self.r - q - 0.5 * sigma**2  # (d,)
+        drift_rate = self.r - q - 0.5 * sigma**2
 
-        # Allocate output
-        paths = torch.empty(n_paths, n_steps + 1, d, device=dev)
+        paths = cfg.sim_empty(n_paths, n_steps + 1, d)
         paths[:, 0, :] = S0.unsqueeze(0)
 
         for i in range(n_steps):
             dt = (time_grid[i + 1] - time_grid[i]).item()
             sqrt_dt = dt**0.5
 
-            # Independent normals → correlated via Cholesky
-            Z = torch.randn(n_paths, d, device=dev)  # (M, d)
-            W = Z @ L.T  # (M, d), correlated increments
+            Z = cfg.sim_randn(n_paths, d)
+            W = Z @ L.T
 
-            # Log-normal exact step: S_{t+dt} = S_t * exp(drift*dt + sigma*sqrt(dt)*W)
-            log_increment = drift_rate * dt + sigma * sqrt_dt * W  # (M, d)
+            log_increment = drift_rate * dt + sigma * sqrt_dt * W
             paths[:, i + 1, :] = paths[:, i, :] * torch.exp(log_increment)
 
         return paths
