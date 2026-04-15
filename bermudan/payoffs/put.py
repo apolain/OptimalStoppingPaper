@@ -9,7 +9,6 @@ class Put(Payoff):
     g(s) = max(K - s, 0)
 
     Features: (log(s/K), g(s)/K, t/T, (T-t)/T).
-    Using log-moneyness instead of s/K because GBM is log-normal.
     """
 
     def __call__(self, S: torch.Tensor) -> torch.Tensor:
@@ -30,10 +29,10 @@ class Put(Payoff):
 
         return torch.stack(
             [
-                torch.log(s / self.K + 1e-8),  # log-moneyness
-                payoff_val / self.K,  # normalised payoff
-                t_val / T,  # normalised time
-                (T - t_val) / T,  # time to maturity
+                torch.log(s / self.K + 1e-8),
+                payoff_val / self.K,
+                t_val / T,
+                (T - t_val) / T,
             ],
             dim=-1,
         )

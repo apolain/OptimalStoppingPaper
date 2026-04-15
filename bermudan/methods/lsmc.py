@@ -32,8 +32,8 @@ class LSMC(PricingMethod):
         cfg = option.cfg
 
         with timer() as t:
-            paths = option.simulate(S0, n_paths)  # (M, N+1, full_dim)
-            obs = option.observable_at_exercise(paths)  # (M, N_S, state_dim)
+            paths = option.simulate(S0, n_paths)
+            obs = option.observable_at_exercise(paths)
 
             M = n_paths
             N_S = option.N_S

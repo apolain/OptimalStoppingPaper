@@ -36,7 +36,7 @@ class DOSNetwork(nn.Module):
 
         self.layers = nn.Sequential(*layers)
 
-        # Xavier uniform init (matching TF default)
+        # Xavier uniform init
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -105,7 +105,7 @@ class DOS(PricingMethod):
         n_paths: int,
         **kwargs,
     ) -> PricingResult:
-        """Train and evaluate. Pass ``logger=ExperimentLogger(...)`` to log."""
+        """Train and evaluate."""
         logger = kwargs.get("logger", None)
         cfg = option.cfg
 
@@ -123,7 +123,7 @@ class DOS(PricingMethod):
         loss_history: dict[int, list[float]] = {}
 
         with timer() as train_timer:
-            # --- Backward training: one network per date ---
+            # Backward training
             for n in range(N_S - 2, -1, -1):
                 net = DOSNetwork(
                     input_dim=d,
@@ -134,21 +134,19 @@ class DOS(PricingMethod):
                 losses = []
 
                 for it in range(self.n_iters):
-                    # Fresh batch at each iteration (key to DOS)
+                    # Fresh batch at each iteration
                     paths = option.simulate(S0, self.batch_size)
                     obs = option.observable_at_exercise(paths)
 
-                    # Raw state at date n (float32 for network)
                     X_n = obs[:, n, :].float()
 
-                    # Immediate exercise value (discounted to 0)
+                    # Immediate exercise value
                     imm = (discount[n] * payoff(obs[:, n, :])).float()
 
-                    # Continuation value from future strategy (hard decisions)
+                    # Continuation value from future strategy
                     with torch.no_grad():
                         # Start with terminal payoff
                         cont = (discount[-1] * payoff(obs[:, -1, :])).float()
-                        # Apply each future network backward
                         for k in range(N_S - 2, n, -1):
                             if networks[k] is not None:
                                 networks[k].eval()
@@ -158,7 +156,6 @@ class DOS(PricingMethod):
                                 imm_k = (discount[k] * payoff(obs[:, k, :])).float()
                                 cont = torch.where(stop_k, imm_k, cont)
 
-                    # Train: maximise E[F(X_n)*imm + (1-F(X_n))*cont]
                     net.train()
                     logit = net(X_n).squeeze(-1)
                     F = torch.sigmoid(logit)
@@ -178,7 +175,7 @@ class DOS(PricingMethod):
                 loss_history[n] = losses
                 networks[n] = net
 
-        # --- Evaluation on fresh paths ---
+        # Evaluation
         with timer() as eval_timer:
             price_val, std_val = self._evaluate(networks, option, S0, n_paths)
 
@@ -224,7 +221,7 @@ class DOS(PricingMethod):
         M = n_paths
         discount = torch.exp(-r * ex_dates).to(cfg.device)
 
-        # Set all networks to eval mode (use BN running stats)
+        # Set all networks to eval mode
         for net in networks:
             if net is not None:
                 net.eval()

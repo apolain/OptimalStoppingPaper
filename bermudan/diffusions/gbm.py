@@ -44,7 +44,7 @@ class GBM(Diffusion):
         else:
             self._rho = torch.eye(d)
 
-        # Cholesky stored in float64 (will be cast to cfg.dtype in simulate)
+        # Cholesky stored in float64
         self._L = torch.linalg.cholesky(self._rho.double())
 
     @property

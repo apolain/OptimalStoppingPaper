@@ -38,7 +38,7 @@ class Diffusion(ABC):
     @property
     @abstractmethod
     def state_dim(self) -> int:
-        """Dimension of the state visible to the payoff function."""
+        """Dimension of the state."""
         ...
 
     @property
