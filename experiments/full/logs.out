@@ -1,0 +1,97 @@
+nohup: ignoring input
+Device: cuda, dtype: torch.float64, sim_dtype: torch.float32
+Log dir: logs/experiment
+Cases: ['A', 'B', 'C', 'scaling']
+
+======================================================================
+CASE A: 1D Bermudan put under GBM
+======================================================================
+
+  S0=36 (ITM), ref=4.486
+    LSMC  : 4.4819  std=0.0065  err=0.0041  train=0.3s  eval=0.0s  params=0
+    PG    : 4.4608  std=0.0057  err=0.0252  train=135.9s  eval=0.3s  params=165889
+
+  S0=40 (ATM), ref=2.314
+    LSMC  : 2.3166  std=0.0061  err=0.0026  train=0.1s  eval=0.0s  params=0
+    PG    : 2.3104  std=0.0060  err=0.0036  train=233.6s  eval=0.4s  params=165889
+
+  S0=44 (OTM), ref=1.118
+    LSMC  : 1.1102  std=0.0046  err=0.0078  train=0.1s  eval=0.0s  params=0
+    PG    : 1.1025  std=0.0043  err=0.0155  train=276.0s  eval=0.6s  params=165889
+
+======================================================================
+CASE B: Bermudan max-call under GBM (symmetric)
+======================================================================
+
+  --- d=2, N_S=9, features=8 ---
+
+    S0=90, ref=8.075
+    LSMC  : 8.0802  std=0.0278  err=0.0052  train=0.0s  eval=0.0s  params=0
+    DOS   : 8.0502  std=0.0270  err=0.0248  train=47.6s  eval=0.0s  params=0
+    PG    : 8.1146  std=0.0267  err=0.0396  train=52.3s  eval=0.1s  params=166913
+
+    S0=100, ref=13.902
+    LSMC  : 13.8766  std=0.0350  err=0.0254  train=0.0s  eval=0.0s  params=0
+    DOS   : 13.8810  std=0.0339  err=0.0210  train=47.3s  eval=0.0s  params=0
+    PG    : 13.9655  std=0.0341  err=0.0635  train=49.2s  eval=0.1s  params=166913
+
+    S0=110, ref=21.345
+    LSMC  : 21.2292  std=0.0412  err=0.1158  train=0.0s  eval=0.0s  params=0
+    DOS   : 21.3170  std=0.0392  err=0.0280  train=47.2s  eval=0.0s  params=0
+    PG    : 21.3638  std=0.0394  err=0.0188  train=45.6s  eval=0.1s  params=166913
+
+  --- d=5, N_S=9, features=11 ---
+
+    S0=90, ref=16.644
+    LSMC  : 16.5396  std=0.0378  err=0.1044  train=0.0s  eval=0.0s  params=0
+    DOS   : 16.5482  std=0.0378  err=0.0958  train=47.2s  eval=0.0s  params=0
+    PG    : 16.4708  std=0.0367  err=0.1732  train=49.7s  eval=0.1s  params=167681
+
+    S0=100, ref=26.156
+    LSMC  : 25.9926  std=0.0452  err=0.1634  train=0.0s  eval=0.0s  params=0
+    DOS   : 26.0622  std=0.0452  err=0.0938  train=47.1s  eval=0.0s  params=0
+    PG    : 25.8924  std=0.0436  err=0.2636  train=48.1s  eval=0.1s  params=167681
+
+    S0=110, ref=36.768
+    LSMC  : 36.5348  std=0.0513  err=0.2332  train=0.1s  eval=0.0s  params=0
+    DOS   : 36.6947  std=0.0511  err=0.0733  train=47.2s  eval=0.0s  params=0
+    PG    : 36.4310  std=0.0502  err=0.3370  train=47.1s  eval=0.1s  params=167681
+
+======================================================================
+CASE C: Bermudan put under Heston
+======================================================================
+  N_S=12, N=48, kappa=2.0, theta=0.04, xi=0.5, rho=-0.7
+
+  S0=90 (ITM)
+    LSMC  : 10.8817  std=0.0190  train=0.0s  eval=0.0s  params=0
+    PG    : 10.8850  std=0.0193  train=442.4s  eval=0.1s  params=165889
+
+  S0=100 (ATM)
+    LSMC  : 6.1897  std=0.0203  train=0.0s  eval=0.0s  params=0
+    PG    : 6.2041  std=0.0210  train=469.0s  eval=0.1s  params=165889
+
+  S0=110 (OTM)
+    LSMC  : 3.7457  std=0.0180  train=0.0s  eval=0.0s  params=0
+    PG    : 3.7653  std=0.0182  train=553.5s  eval=0.2s  params=165889
+
+======================================================================
+SCALING: PG vs DOS as a function of N_S
+======================================================================
+
+  --- d=2, S0=100 ---
+     N_S   PG_price   PG_time  DOS_price  DOS_time
+       9     13.965     46.1s     13.881     48.1s
+      20     14.013    103.0s     14.030    204.3s
+      50     14.187    227.8s     14.118   1078.7s
+     100     14.207    490.8s     14.175   4036.8s
+
+  --- d=10, S0=100 ---
+     N_S   PG_price   PG_time  DOS_price  DOS_time
+       9     37.872     52.0s     37.444     49.2s
+      20     38.170    108.5s     37.712    190.4s
+      50     38.394    242.0s     37.913   1011.6s
+     100     38.434    506.6s     37.929   3997.1s
+
+======================================================================
+ALL DONE — results in logs/experiment/summary.csv
+======================================================================
