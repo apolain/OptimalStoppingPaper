@@ -19,6 +19,7 @@ The implementation is built around a reusable pricing library ("bermudan") and a
 
 ## Repository structure
 
+```
 OptimalStoppingPaper/
 │
 ├── bermudan/
@@ -34,6 +35,7 @@ OptimalStoppingPaper/
 │
 ├── Pipfile
 └── Pipfile.lock
+```
 
 ---
 
