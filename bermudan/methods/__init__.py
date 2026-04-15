@@ -1,3 +1,4 @@
+from .actor_critic import ActorCritic
 from .base import PricingMethod, PricingResult
 from .dos import DOS
 from .lsmc import LSMC
