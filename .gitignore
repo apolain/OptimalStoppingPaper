@@ -219,5 +219,5 @@ __marimo__/
 figures/
 *.csv
 *.json
-*.out
 *.pt
+figures_v1/

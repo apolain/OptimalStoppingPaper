@@ -77,7 +77,7 @@ class ActorCritic(PricingMethod):
         payoff = option.payoff
         n_feat = payoff.n_features
 
-        # Actor: logit output (same as PG)
+        # Actor: logit output
         actor = FeedForward(
             input_dim=n_feat,
             hidden_dims=self.actor_dims,
@@ -117,7 +117,6 @@ class ActorCritic(PricingMethod):
                 rewards = cfg.zeros(M)
 
                 # Collect value estimates at the first decision point for each path
-                # (state-dependent baseline)
                 value_estimates = torch.zeros(M, device=cfg.device, dtype=torch.float32)
                 first_features = None
 

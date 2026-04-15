@@ -7,13 +7,14 @@ import torch
 sys.path.append(str(Path(__file__).resolve().parents[2]))
 from bermudan import *
 
-# Case A: 1D Bermudan put under GBM
+# =====================================================================
+# Case configs
+# =====================================================================
 CASE_A = dict(r=0.06, sigma=0.2, q=0.0, K=40.0, T=1.0, N=50)
 CASE_A_SPOTS = [36, 40, 44]
 CASE_A_LABELS = {36: "ITM", 40: "ATM", 44: "OTM"}
 CASE_A_REFS = {36: 4.486, 40: 2.314, 44: 1.118}
 
-# Case B: max-call GBM symmetric
 CASE_B = dict(r=0.05, q=0.1, sigma=0.2, K=100.0, T=3.0, N=9)
 CASE_B_SPOTS = [90, 100, 110]
 CASE_B_REFS = {
@@ -25,7 +26,6 @@ CASE_B_REFS = {
     (5, 110): 36.768,
 }
 
-# Case C: Heston put
 CASE_C = dict(
     r=0.03,
     q=0.0,
@@ -42,6 +42,9 @@ CASE_C_SPOTS = [90, 100, 110]
 CASE_C_LABELS = {90: "ITM", 100: "ATM", 110: "OTM"}
 
 
+# =====================================================================
+# Option builders
+# =====================================================================
 def build_case_a(cfg):
     p = CASE_A
     return BermudanOption(
@@ -69,9 +72,7 @@ def build_case_b(d, cfg):
 
 
 def build_case_b_scaling(d, N_S, cfg):
-    """Case B with variable number of exercise dates for scaling experiment."""
     p = CASE_B
-    # N = N_S so each simulation step is an exercise date
     return BermudanOption(
         diffusion=GBM(r=p["r"], sigma=p["sigma"], q=p["q"], rho=torch.eye(d), d=d),
         payoff=MaxCall(K=p["K"], d=d),
@@ -103,43 +104,49 @@ def build_case_c(cfg):
     )
 
 
-def run_method(method, option, S0, n_eval, logger, run_cfg, **price_kwargs):
-    """Run a pricing method with full logging."""
+# =====================================================================
+# Helpers
+# =====================================================================
+def run_method(method, option, S0, n_eval, logger, run_cfg):
     logger.start_run(run_cfg)
     res = method.price(option, S0, n_eval, logger=logger)
-
-    train_time = res.info.get("train_time", res.elapsed)
-    eval_time = res.info.get("eval_time", 0.0)
-    n_params = res.info.get("n_params", 0)
-
     logger.end_run(
         price=res.price,
         std=res.std,
-        train_time=train_time,
-        eval_time=eval_time,
-        n_params=n_params,
+        train_time=res.info.get("train_time", res.elapsed),
+        eval_time=res.info.get("eval_time", 0.0),
+        n_params=res.info.get("n_params", 0),
     )
     return res
 
 
 def print_result(method_name, res, ref=None):
     err_str = f"  err={abs(res.price - ref):.4f}" if ref else ""
-    t_train = res.info.get("train_time", res.elapsed)
-    t_eval = res.info.get("eval_time", 0.0)
+    t = res.info.get("train_time", res.elapsed)
     n_p = res.info.get("n_params", 0)
     print(
         f"    {method_name:6s}: {res.price:.4f}  std={res.std:.4f}"
-        f"{err_str}  train={t_train:.1f}s  eval={t_eval:.1f}s"
-        f"  params={n_p}"
+        f"{err_str}  train={t:.1f}s  params={n_p}"
     )
 
 
-def run_case_a(cfg, logger, M_lsmc, M_pg, pg_kwargs, quick=False):
+def _itm_override(kw, label, quick):
+    """Apply ITM-specific overrides."""
+    kw = dict(kw)
+    if label == "ITM" and not quick:
+        kw["n_epochs"] = max(kw.get("n_epochs", 500), 1000)
+        kw["entropy_coeff"] = max(kw.get("entropy_coeff", 0.05), 0.10)
+    return kw
+
+
+# =====================================================================
+# Case runners
+# =====================================================================
+def run_case_a(cfg, logger, M_lsmc, M_pg, pg_kwargs, a2c_kwargs, quick=False):
     print("\n" + "=" * 70)
     print("CASE A: 1D Bermudan put under GBM")
     print("=" * 70)
     option = build_case_a(cfg)
-
     lsmc = LSMC(degree=3, use_payoff_in_basis=False)
 
     for s0 in CASE_A_SPOTS:
@@ -164,10 +171,7 @@ def run_case_a(cfg, logger, M_lsmc, M_pg, pg_kwargs, quick=False):
 
         # PG
         set_seed(42)
-        kw = dict(pg_kwargs)
-        if label == "ITM" and not quick:
-            kw["n_epochs"] = max(kw.get("n_epochs", 500), 1000)
-            kw["entropy_coeff"] = max(kw.get("entropy_coeff", 0.05), 0.10)
+        kw = _itm_override(pg_kwargs, label, quick)
         pg = PolicyGradient(**kw)
         rc = RunConfig(
             method="PG",
@@ -181,9 +185,34 @@ def run_case_a(cfg, logger, M_lsmc, M_pg, pg_kwargs, quick=False):
         res = run_method(pg, option, S0, M_pg, logger, rc)
         print_result("PG", res, ref)
 
+        # A2C
+        set_seed(42)
+        kw = _itm_override(a2c_kwargs, label, quick)
+        a2c = ActorCritic(**kw)
+        rc = RunConfig(
+            method="A2C",
+            case="A",
+            d=1,
+            S0=float(s0),
+            N_S=option.N_S,
+            N=option.N,
+            hyperparams=kw,
+        )
+        res = run_method(a2c, option, S0, M_pg, logger, rc)
+        print_result("A2C", res, ref)
+
 
 def run_case_b(
-    cfg, logger, M_lsmc, M_pg, M_dos, pg_kwargs, dos_kwargs, dims=None, quick=False
+    cfg,
+    logger,
+    M_lsmc,
+    M_pg,
+    M_dos,
+    pg_kwargs,
+    a2c_kwargs,
+    dos_kwargs,
+    dims=None,
+    quick=False,
 ):
     print("\n" + "=" * 70)
     print("CASE B: Bermudan max-call under GBM (symmetric)")
@@ -205,7 +234,7 @@ def run_case_b(
             ref_str = f"ref={ref:.3f}" if ref else "ref=N/A"
             print(f"\n    S0={s0}, {ref_str}")
 
-            # LSMC
+            # LSMC (only d <= 5)
             if d <= 5:
                 set_seed(42)
                 rc = RunConfig(
@@ -250,8 +279,23 @@ def run_case_b(
             res = run_method(pg, option, S0, M_pg, logger, rc)
             print_result("PG", res, ref)
 
+            # A2C
+            set_seed(42)
+            a2c = ActorCritic(**a2c_kwargs)
+            rc = RunConfig(
+                method="A2C",
+                case="B_sym",
+                d=d,
+                S0=float(s0),
+                N_S=option.N_S,
+                N=option.N,
+                hyperparams=a2c_kwargs,
+            )
+            res = run_method(a2c, option, S0, M_pg, logger, rc)
+            print_result("A2C", res, ref)
 
-def run_case_c(cfg, logger, M_lsmc, M_pg, pg_kwargs, quick=False):
+
+def run_case_c(cfg, logger, M_lsmc, M_pg, pg_kwargs, a2c_kwargs, quick=False):
     print("\n" + "=" * 70)
     print("CASE C: Bermudan put under Heston")
     print("=" * 70)
@@ -263,10 +307,6 @@ def run_case_c(cfg, logger, M_lsmc, M_pg, pg_kwargs, quick=False):
     )
 
     lsmc = LSMC(degree=3, use_payoff_in_basis=False)
-
-    pg_kw_c = dict(pg_kwargs)
-    if not quick:
-        pg_kw_c["batch_size"] = max(pg_kw_c.get("batch_size", 200_000), 500_000)
 
     for s0 in CASE_C_SPOTS:
         label = CASE_C_LABELS[s0]
@@ -289,10 +329,7 @@ def run_case_c(cfg, logger, M_lsmc, M_pg, pg_kwargs, quick=False):
 
         # PG
         set_seed(42)
-        kw = dict(pg_kw_c)
-        if label == "ITM" and not quick:
-            kw["n_epochs"] = max(kw.get("n_epochs", 500), 1000)
-            kw["entropy_coeff"] = max(kw.get("entropy_coeff", 0.05), 0.10)
+        kw = _itm_override(pg_kwargs, label, quick)
         pg = PolicyGradient(**kw)
         rc = RunConfig(
             method="PG",
@@ -306,11 +343,28 @@ def run_case_c(cfg, logger, M_lsmc, M_pg, pg_kwargs, quick=False):
         res = run_method(pg, option, S0, M_pg, logger, rc)
         print_result("PG", res)
 
+        # A2C
+        set_seed(42)
+        kw = _itm_override(a2c_kwargs, label, quick)
+        a2c = ActorCritic(**kw)
+        rc = RunConfig(
+            method="A2C",
+            case="C",
+            d=1,
+            S0=float(s0),
+            N_S=option.N_S,
+            N=option.N,
+            hyperparams=kw,
+        )
+        res = run_method(a2c, option, S0, M_pg, logger, rc)
+        print_result("A2C", res)
 
-def run_scaling_ns(cfg, logger, M_pg, M_dos, pg_kwargs, dos_kwargs, quick=False):
-    """Scaling experiment: vary N_S at fixed d, measure price + time."""
+
+def run_scaling_ns(
+    cfg, logger, M_pg, M_dos, pg_kwargs, a2c_kwargs, dos_kwargs, quick=False
+):
     print("\n" + "=" * 70)
-    print("SCALING: PG vs DOS as a function of N_S")
+    print("SCALING: PG vs A2C vs DOS as a function of N_S")
     print("=" * 70)
 
     if quick:
@@ -320,12 +374,13 @@ def run_scaling_ns(cfg, logger, M_pg, M_dos, pg_kwargs, dos_kwargs, quick=False)
         dims = [2, 10]
         ns_values = [9, 20, 50, 100]
 
-    s0_val = 100  # ATM
+    s0_val = 100
 
     for d in dims:
         print(f"\n  --- d={d}, S0={s0_val} ---")
         print(
             f"  {'N_S':>6s}  {'PG_price':>9s}  {'PG_time':>8s}  "
+            f"{'A2C_price':>9s}  {'A2C_time':>8s}  "
             f"{'DOS_price':>9s}  {'DOS_time':>8s}"
         )
 
@@ -333,14 +388,15 @@ def run_scaling_ns(cfg, logger, M_pg, M_dos, pg_kwargs, dos_kwargs, quick=False)
             option = build_case_b_scaling(d, ns, cfg)
             S0 = cfg.tensor([float(s0_val)] * d)
 
-            # Reduce batch for large N_S to avoid OOM
-            pg_kw_scaled = dict(pg_kwargs)
+            pg_kw = dict(pg_kwargs)
+            a2c_kw = dict(a2c_kwargs)
             if ns > 50:
-                pg_kw_scaled["batch_size"] = min(pg_kw_scaled["batch_size"], 50_000)
+                pg_kw["batch_size"] = min(pg_kw["batch_size"], 50_000)
+                a2c_kw["batch_size"] = min(a2c_kw["batch_size"], 50_000)
 
             # PG
             set_seed(42)
-            pg = PolicyGradient(**pg_kw_scaled)
+            pg = PolicyGradient(**pg_kw)
             rc = RunConfig(
                 method="PG",
                 case="scaling",
@@ -348,12 +404,27 @@ def run_scaling_ns(cfg, logger, M_pg, M_dos, pg_kwargs, dos_kwargs, quick=False)
                 S0=float(s0_val),
                 N_S=ns,
                 N=ns,
-                hyperparams={**pg_kw_scaled, "experiment": "scaling_ns"},
+                hyperparams={**pg_kw, "experiment": "scaling_ns"},
             )
             res_pg = run_method(pg, option, S0, M_pg, logger, rc)
-
-            # Free memory before DOS
             del pg
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # A2C
+            set_seed(42)
+            a2c = ActorCritic(**a2c_kw)
+            rc = RunConfig(
+                method="A2C",
+                case="scaling",
+                d=d,
+                S0=float(s0_val),
+                N_S=ns,
+                N=ns,
+                hyperparams={**a2c_kw, "experiment": "scaling_ns"},
+            )
+            res_a2c = run_method(a2c, option, S0, M_pg, logger, rc)
+            del a2c
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -370,19 +441,23 @@ def run_scaling_ns(cfg, logger, M_pg, M_dos, pg_kwargs, dos_kwargs, quick=False)
                 hyperparams={**dos_kwargs, "experiment": "scaling_ns"},
             )
             res_dos = run_method(dos, option, S0, M_dos, logger, rc)
-
             del dos
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
             pg_t = res_pg.info.get("train_time", res_pg.elapsed)
+            a2c_t = res_a2c.info.get("train_time", res_a2c.elapsed)
             dos_t = res_dos.info.get("train_time", res_dos.elapsed)
             print(
                 f"  {ns:>6d}  {res_pg.price:>9.3f}  {pg_t:>7.1f}s  "
+                f"{res_a2c.price:>9.3f}  {a2c_t:>7.1f}s  "
                 f"{res_dos.price:>9.3f}  {dos_t:>7.1f}s"
             )
 
 
+# =====================================================================
+# Main
+# =====================================================================
 def parse_args():
     p = argparse.ArgumentParser(description="Run paper experiments")
     p.add_argument("--device", default="cpu")
@@ -417,7 +492,16 @@ if __name__ == "__main__":
             batch_size=50_000,
             entropy_coeff=0.05,
             clip_grad_norm=2.0,
-            baseline_ema=0.95,
+        )
+        a2c_kwargs = dict(
+            actor_dims=[64, 64],
+            critic_dims=[64, 64],
+            lr_actor=1e-4,
+            lr_critic=1e-3,
+            n_epochs=100,
+            batch_size=50_000,
+            entropy_coeff=0.05,
+            clip_grad_norm=2.0,
         )
         dos_kwargs = dict(hidden_dims=None, lr=1e-3, n_iters=200, batch_size=4096)
     else:
@@ -432,15 +516,26 @@ if __name__ == "__main__":
             entropy_coeff=0.05,
             clip_grad_norm=2.0,
         )
+        a2c_kwargs = dict(
+            actor_dims=[256, 256, 256, 128],
+            critic_dims=[128, 128],
+            lr_actor=1e-4,
+            lr_critic=1e-3,
+            n_epochs=750,
+            batch_size=50_000,
+            entropy_coeff=0.05,
+            clip_grad_norm=2.0,
+        )
         dos_kwargs = dict(hidden_dims=None, lr=1e-3, n_iters=1000, batch_size=8192)
 
     print(f"Device: {cfg.device}, dtype: {cfg.dtype}, sim_dtype: {cfg.sim_dtype}")
     print(f"Log dir: {args.log_dir}")
     print(f"Cases: {args.cases}")
+    print(f"PG config: {pg_kwargs}")
+    print(f"A2C config: {a2c_kwargs}")
 
     if "A" in args.cases:
-        run_case_a(cfg, logger, M_lsmc, M_pg, pg_kwargs, quick=args.quick)
-
+        run_case_a(cfg, logger, M_lsmc, M_pg, pg_kwargs, a2c_kwargs, quick=args.quick)
     if "B" in args.cases:
         b_dims = args.b_dims or ([2, 5] if not args.quick else [2])
         run_case_b(
@@ -450,17 +545,23 @@ if __name__ == "__main__":
             M_pg,
             M_dos,
             pg_kwargs,
+            a2c_kwargs,
             dos_kwargs,
             dims=b_dims,
             quick=args.quick,
         )
-
     if "C" in args.cases:
-        run_case_c(cfg, logger, M_lsmc, M_pg, pg_kwargs, quick=args.quick)
-
+        run_case_c(cfg, logger, M_lsmc, M_pg, pg_kwargs, a2c_kwargs, quick=args.quick)
     if "scaling" in args.cases:
         run_scaling_ns(
-            cfg, logger, M_pg, M_dos, pg_kwargs, dos_kwargs, quick=args.quick
+            cfg,
+            logger,
+            M_pg,
+            M_dos,
+            pg_kwargs,
+            a2c_kwargs,
+            dos_kwargs,
+            quick=args.quick,
         )
 
     print("\n" + "=" * 70)
