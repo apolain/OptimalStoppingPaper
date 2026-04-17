@@ -44,7 +44,6 @@ class GBM(Diffusion):
         else:
             self._rho = torch.eye(d)
 
-        # Cholesky stored in float64
         self._L = torch.linalg.cholesky(self._rho.double())
 
     @property
@@ -101,6 +100,52 @@ class GBM(Diffusion):
             Z = cfg.sim_randn(n_paths, d)
             W = Z @ L.T
 
+            log_increment = drift_rate * dt + sigma * sqrt_dt * W
+            paths[:, i + 1, :] = paths[:, i, :] * torch.exp(log_increment)
+
+        return paths
+
+    def simulate_batch(
+        self,
+        S0_batch: torch.Tensor,
+        time_grid: torch.Tensor,
+        cfg: TorchConfig | None = None,
+    ) -> torch.Tensor:
+        """Simulate one path per initial state in S0_batch.
+
+        Parameters
+        ----------
+        S0_batch : Tensor, shape (n_batch, d)
+            Each row is a distinct initial state.
+        time_grid : Tensor, shape (n_steps+1,)
+        cfg : TorchConfig or None
+
+        Returns
+        -------
+        paths : Tensor, shape (n_batch, n_steps+1, d), dtype=sim_dtype
+        """
+        cfg = self._resolve_cfg(S0_batch, cfg)
+        sd = cfg.sim_dtype
+        d = self.d
+        n_batch = S0_batch.shape[0]
+        n_steps = len(time_grid) - 1
+
+        sigma = torch.tensor(self._sigma, device=cfg.device, dtype=sd)
+        q = torch.tensor(self._q, device=cfg.device, dtype=sd)
+        L = self._L.to(device=cfg.device, dtype=sd)
+        S0_batch = S0_batch.to(device=cfg.device, dtype=sd)
+        time_grid = time_grid.to(device=cfg.device, dtype=torch.float64)
+
+        drift_rate = self.r - q - 0.5 * sigma**2
+
+        paths = cfg.sim_empty(n_batch, n_steps + 1, d)
+        paths[:, 0, :] = S0_batch
+
+        for i in range(n_steps):
+            dt = (time_grid[i + 1] - time_grid[i]).item()
+            sqrt_dt = dt**0.5
+            Z = cfg.sim_randn(n_batch, d)
+            W = Z @ L.T
             log_increment = drift_rate * dt + sigma * sqrt_dt * W
             paths[:, i + 1, :] = paths[:, i, :] * torch.exp(log_increment)
 

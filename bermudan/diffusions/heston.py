@@ -109,3 +109,59 @@ class Heston(Diffusion):
             S[:, i + 1] = S[:, i] * torch.exp(log_inc)
 
         return torch.stack([S, nu], dim=-1)
+
+    def simulate_batch(
+        self,
+        S0_batch: torch.Tensor,
+        time_grid: torch.Tensor,
+        cfg: TorchConfig | None = None,
+    ) -> torch.Tensor:
+        """Simulate one path per initial state in S0_batch.
+
+        Parameters
+        ----------
+        S0_batch : Tensor, shape (n_batch, 2)
+            Each row is (S_0, nu_0).
+        time_grid : Tensor, shape (n_steps+1,)
+
+        Returns
+        -------
+        paths : Tensor, shape (n_batch, n_steps+1, 2), dtype=sim_dtype
+        """
+        cfg = self._resolve_cfg(S0_batch, cfg)
+        sd = cfg.sim_dtype
+        S0_batch = S0_batch.to(device=cfg.device, dtype=sd)
+        time_grid = time_grid.to(device=cfg.device, dtype=torch.float64)
+
+        n_batch = S0_batch.shape[0]
+        n_steps = len(time_grid) - 1
+
+        rho = self.rho
+        L22 = (1.0 - rho**2) ** 0.5
+
+        S = cfg.sim_empty(n_batch, n_steps + 1)
+        nu = cfg.sim_empty(n_batch, n_steps + 1)
+        S[:, 0] = S0_batch[:, 0]
+        nu[:, 0] = S0_batch[:, 1]
+
+        for i in range(n_steps):
+            dt = (time_grid[i + 1] - time_grid[i]).item()
+            sqrt_dt = dt**0.5
+
+            nu_pos = nu[:, i].clamp(min=0.0)
+            sqrt_nu = nu_pos.sqrt()
+
+            Z1 = cfg.sim_randn(n_batch)
+            Z2 = cfg.sim_randn(n_batch)
+            dW_S = sqrt_dt * Z1
+            dW_nu = sqrt_dt * (rho * Z1 + L22 * Z2)
+
+            nu[:, i + 1] = (
+                nu[:, i]
+                + self.kappa * (self.theta - nu_pos) * dt
+                + self.xi * sqrt_nu * dW_nu
+            )
+            log_inc = (self.r - self.q - 0.5 * nu_pos) * dt + sqrt_nu * dW_S
+            S[:, i + 1] = S[:, i] * torch.exp(log_inc)
+
+        return torch.stack([S, nu], dim=-1)
